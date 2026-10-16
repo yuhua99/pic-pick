@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="zh-Hant">
+<meta charset="utf-8">
+<title>pic-pick</title>
+<style>
+  :root { --bar: 44px; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px system-ui, sans-serif; background: #111; color: #ddd; overflow: hidden; }
+  button, input { font: inherit; color: inherit; background: #2a2a2a; border: 1px solid #444; border-radius: 4px; padding: 4px 10px; }
+  button:disabled { opacity: .4; }
+  button.on { background: #345; border-color: #4af; }
+  #bar { height: var(--bar); display: flex; gap: 6px; align-items: center; padding: 0 10px; background: #1b1b1b; }
+  #folder { flex: 1; min-width: 0; }
+  #msg { max-width: 30%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #aaa; }
+  #msg.err { color: #f77; }
+  #grid { height: calc(100vh - var(--bar)); overflow-y: auto; scroll-snap-type: y mandatory; }
+  #empty { padding: 40px; text-align: center; color: #888; }
+  .row { height: calc((100vh - var(--bar)) / 3); scroll-snap-align: start; display: grid;
+         grid-template-columns: repeat(5, 1fr); gap: 8px; padding: 4px 8px; }
+  .card { position: relative; border-radius: 4px; overflow: hidden; outline: 3px solid transparent; cursor: pointer; }
+  .card.cur { outline-color: #4af; }
+  .card img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .tag { position: absolute; left: 6px; bottom: 6px; background: #000b; padding: 1px 6px; border-radius: 3px; }
+  #group { position: fixed; inset: 0; background: #111; display: none; grid-template: 1fr 110px / 1fr 280px; }
+  #group.on { display: grid; }
+  #stage { grid-area: 1 / 1; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  #stage img { max-width: 100%; max-height: 100%; }
+  #stage.zoom { overflow: auto; display: block; }
+  #stage.zoom img { max-width: none; max-height: none; }
+  #side { grid-area: 1 / 2 / 3 / 3; padding: 12px; overflow: auto; background: #1b1b1b; line-height: 1.6; }
+  #side table { width: 100%; border-collapse: collapse; }
+  #side td:last-child { text-align: right; }
+  #strip { grid-area: 2 / 1; display: flex; gap: 6px; padding: 6px; overflow-x: auto; }
+  .f { flex: 0 0 auto; height: 100%; aspect-ratio: 3 / 2; position: relative; outline: 3px solid transparent; cursor: pointer; }
+  .f.cur { outline-color: #4af; }
+  .f:not(.keep) img { opacity: .45; }
+  .f img { width: 100%; height: 100%; object-fit: cover; }
+  .warn { color: #fc6; }
+  .keys { color: #888; font-size: 12px; margin-top: 12px; }
+</style>
+
+<div id="bar">
+  <button id="choose">選資料夾</button>
+  <input id="folder" placeholder="照片資料夾路徑，Enter 載入">
+  <button data-job="group">Group</button>
+  <button data-job="rank">Pick</button>
+  <button data-job="export">Export</button>
+  <button data-filter="all" class="on">全部</button>
+  <button data-filter="review">需檢查</button>
+  <button data-filter="todo">未確認</button>
+  <span id="msg"></span>
+</div>
+<div id="grid"></div>
+<div id="group">
+  <div id="stage"><img></div>
+  <div id="side"></div>
+  <div id="strip"></div>
+</div>
+
+<script>
+const ROWS = 3, COLS = 5, MAX_LOADS = 6, STRIP_NEAR = 6;
+const $ = (s) => document.querySelector(s);
+const grid = $("#grid"), stage = $("#stage");
+let folder = localStorage.folder || "";
+let data = null, view = [], cards = [], cur = 0, filter = "all";
+// kept = Jev's best unless dropped, or explicitly kept (same rule as export)
+let best = new Set(), keep = new Set(), drop = new Set(), seen = new Set();
+const kept = (name) => (best.has(name) || keep.has(name)) && !drop.has(name);
+let gi = -1, pi = 0;  // open group / photo, -1 = overview
+
+const qs = (o) => new URLSearchParams(o).toString();
+const thumbUrl = (m) => "/api/thumb?" + qs({ folder, sha: m.sha });
+
+async function api(path, body) {
+  const opts = body === undefined ? {} :
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const r = await fetch(path, opts);
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error);
+  return j;
+}
+
+function say(text, err = false) {
+  const m = $("#msg");
+  m.textContent = text;
+  m.title = text;
+  m.classList.toggle("err", err);
+}
+
+async function guard(fn) {
+  try { await fn(); } catch (e) { say(e.message, true); }
+}
+
+// ---------- folder + state ----------
+
+async function load() {
+  $("#folder").value = folder;
+  if (!folder) return;
+  data = await api("/api/state?" + qs({ folder }));
+  best = new Set((data.groups || []).map((g) => g.best).filter(Boolean));
+  keep = new Set(data.keep);
+  drop = new Set(data.drop);
+  seen = new Set(data.seen);
+  if (gi >= 0) hideGroup();  // a finished job reorders groups; the open one would point elsewhere
+  render();
+}
+
+$("#choose").onclick = () => guard(async () => {
+  const r = await api("/api/choose", {});
+  if (!r.folder) return;
+  localStorage.folder = folder = r.folder;
+  await load();
+});
+$("#folder").onkeydown = (e) => {
+  if (e.key !== "Enter") return;
+  localStorage.folder = folder = e.target.value.trim();
+  guard(load);
+  e.target.blur();
+};
+
+// ---------- jobs ----------
+
+document.querySelectorAll("[data-job]").forEach((b) => b.onclick = () => guard(async () => {
+  const kind = b.dataset.job;
+  if (!folder) throw new Error("先選資料夾");
+  if (kind === "rank" && !confirm("送 Jev 評分？已評過的照片不會重送。")) return;
+  if (kind === "export") {
+    if (!confirm("把保留的照片搬到 -picked 資料夾，其他搬回原資料夾？")) return;
+    await savePicks();
+  }
+  await api("/api/" + kind, { folder });
+  poll();
+}));
+
+async function poll() {
+  const j = await api("/api/job");
+  document.querySelectorAll("[data-job]").forEach((b) => b.disabled = j.running);
+  if (j.running) {
+    say(j.kind + " " + (j.stage ? j.stage + " " + j.done + "/" + j.total : "…"));
+    setTimeout(poll, 500);
+  } else if (j.kind) {
+    if (j.error) say(j.kind + " 失敗：" + j.error, true);
+    else say(j.message || j.kind + " 完成");
+    await load();
+  }
+}
+
+// ---------- picks ----------
+
+let saveTimer;
+function savePicks() {
+  clearTimeout(saveTimer);
+  return api("/api/picks", { folder, keep: [...keep], drop: [...drop], seen: [...seen] });
+}
+function changed() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => guard(savePicks), 300);
+}
+const confirmed = (g) => g.members.every((m) => seen.has(m.name));
+
+// ---------- overview ----------
+
+document.querySelectorAll("[data-filter]").forEach((b) => b.onclick = () => setFilter(b.dataset.filter));
+function setFilter(f) {
+  filter = f;
+  document.querySelectorAll("[data-filter]").forEach((b) => b.classList.toggle("on", b.dataset.filter === f));
+  render();
+}
+
+function tagText(g) {
+  const n = g.members.filter((m) => kept(m.name)).length;
+  return "×" + g.members.length + "  ★" + n + (g.needs_review ? "  ⚠" : "") + (confirmed(g) ? "  ✓" : "");
+}
+
+function render() {
+  for (const card of cards) unload(card);  // aborts downloads and frees blob URLs
+  grid.replaceChildren();
+  cards = [];
+  if (!data || !data.groups) {
+    grid.innerHTML = '<div id="empty">' + (folder ? "還沒分組，按 Group" : "先選資料夾") + "</div>";
+    return;
+  }
+  const counts = { review: data.groups.filter((g) => g.needs_review).length,
+                   todo: data.groups.filter((g) => !confirmed(g)).length };
+  $('[data-filter="review"]').textContent = "需檢查 " + counts.review;
+  $('[data-filter="todo"]').textContent = "未確認 " + counts.todo;
+  view = data.groups.filter((g) => filter === "all" || (filter === "review" ? g.needs_review : !confirmed(g)));
+  for (let i = 0; i < view.length; i += COLS) {
+    const row = document.createElement("div");
+    row.className = "row";
+    for (const g of view.slice(i, i + COLS)) {
+      const card = document.createElement("div");
+      const n = cards.length;
+      card.className = "card";
+      card.style.background = g.members[0].color;  // shown until the thumbnail loads
+      card.dataset.src = thumbUrl(g.members[0]);
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = tagText(g);
+      card.append(tag);
+      card.onclick = () => { moveCursor(n); openGroup(n); };
+      row.append(card);
+      cards.push(card);
+    }
+    grid.append(row);
+  }
+  moveCursor(Math.min(cur, view.length - 1));
+  refreshImages();
+}
+
+// Thumbnails load only after scrolling stops, for the visible rows plus one row each side.
+// Rows leaving that window drop their images and abort in-flight downloads.
+let queue = [];
+const loading = new Map();  // card -> AbortController
+
+function rowHeight() { return grid.clientHeight / ROWS; }
+function firstRow() { return Math.round(grid.scrollTop / rowHeight()); }
+
+function refreshImages() {
+  if (gi >= 0) return;
+  const first = firstRow();
+  const wanted = [];
+  cards.forEach((card, n) => {
+    const row = Math.floor(n / COLS);
+    if (row < first - 1 || row > first + ROWS) return unload(card);
+    if (!card.querySelector("img") && !loading.has(card)) {
+      wanted.push({ card, prio: row >= first && row < first + ROWS ? 0 : 1 });
+    }
+  });
+  queue = wanted.sort((a, b) => a.prio - b.prio).map((w) => w.card);
+  pump();
+}
+
+function unload(card) {
+  loading.get(card)?.abort();
+  loading.delete(card);
+  const img = card.querySelector("img");
+  if (img) { URL.revokeObjectURL(img.src); img.remove(); }
+}
+
+function pump() {
+  while (loading.size < MAX_LOADS && queue.length) fetchInto(queue.shift());
+}
+
+async function fetchInto(card) {
+  const ctl = new AbortController();
+  loading.set(card, ctl);
+  try {
+    const r = await fetch(card.dataset.src, { signal: ctl.signal });
+    if (!r.ok) throw new Error("thumbnail " + r.status);  // no <img>, so the next refresh retries
+    const blob = await r.blob();
+    if (ctl.signal.aborted) return;
+    const img = new Image();
+    img.src = URL.createObjectURL(blob);
+    card.prepend(img);
+  } catch (e) {
+    if (e.name !== "AbortError") console.warn(e);
+  } finally {
+    if (loading.get(card) === ctl) loading.delete(card);
+    pump();
+  }
+}
+
+if ("onscrollend" in window) grid.addEventListener("scrollend", refreshImages);
+else {
+  let t;
+  grid.addEventListener("scroll", () => { clearTimeout(t); t = setTimeout(refreshImages, 100); });
+}
+window.addEventListener("resize", refreshImages);
+
+function moveCursor(n) {
+  if (!cards.length) return;
+  cur = Math.max(0, Math.min(cards.length - 1, n));
+  cards.forEach((c, i) => c.classList.toggle("cur", i === cur));
+  const row = Math.floor(cur / COLS), first = firstRow();
+  if (row < first) grid.scrollTo({ top: row * rowHeight(), behavior: "smooth" });
+  else if (row >= first + ROWS) grid.scrollTo({ top: (row - ROWS + 1) * rowHeight(), behavior: "smooth" });
+}
+
+// ---------- group view ----------
+
+function openGroup(n) {
+  gi = n;
+  pi = 0;
+  $("#group").classList.add("on");
+  showGroup();
+}
+
+function hideGroup() {
+  gi = -1;
+  $("#group").classList.remove("on");
+  stage.querySelector("img").removeAttribute("src");  // stops a zoomed original download
+}
+
+function closeGroup() {
+  hideGroup();
+  render();  // refresh tags; keeps the cursor on this group
+}
+
+const pct = (v) => v == null ? "–" : v.toFixed(2);
+
+function showGroup() {
+  const g = view[gi], m = g.members[pi];
+  stage.classList.remove("zoom");
+  stage.querySelector("img").src = thumbUrl(m);
+
+  const side = $("#side");
+  side.replaceChildren();
+  const line = (text, cls) => {
+    const d = document.createElement("div");
+    d.textContent = text;
+    if (cls) d.className = cls;
+    side.append(d);
+  };
+  line("組 " + (gi + 1) + " / " + view.length + "（" + g.members.length + " 張）" + (confirmed(g) ? " ✓" : ""));
+  if (g.needs_review) line("⚠ 前兩名分數接近", "warn");
+  line(m.name);
+  line(kept(m.name) ? "★ 保留" : "未保留");
+  if (m.flags?.length) line("⚑ " + m.flags.join(", "), "warn");
+  const rows = [["total", m.total]];
+  if (m.scores) {
+    for (const [k, v] of Object.entries(m.scores.jev || {})) rows.push([k, v]);
+    rows.push(["sharpness", m.scores.sharpness], ["over", m.scores.over], ["under", m.scores.under]);
+    if (m.scores.risks.length) rows.push(["risks", m.scores.risks.join(", ")]);
+  }
+  const table = document.createElement("table");
+  for (const [k, v] of rows) {
+    const tr = table.insertRow();
+    tr.insertCell().textContent = k;
+    tr.insertCell().textContent = typeof v === "number" ? (k === "sharpness" ? v.toFixed(0) : pct(v)) : (v ?? "–");
+  }
+  side.append(table);
+  line("←/→ 換張  ↑/↓ 換組  Space 保留  X 不保留  Enter 確認並下一組  Z 原圖  Esc 返回", "keys");
+
+  const strip = $("#strip");
+  strip.replaceChildren();
+  g.members.forEach((x, i) => {
+    const f = document.createElement("div");
+    f.className = "f" + (i === pi ? " cur" : "") + (kept(x.name) ? " keep" : "");
+    f.style.background = x.color;
+    if (Math.abs(i - pi) <= STRIP_NEAR) {  // big bursts: only thumbnails near the current photo
+      const img = new Image();
+      img.src = thumbUrl(x);
+      f.append(img);
+    }
+    f.onclick = () => { pi = i; showGroup(); };
+    strip.append(f);
+  });
+  strip.children[pi].scrollIntoView({ block: "nearest", inline: "nearest" });
+
+  const next = view[gi + 1];
+  if (next) new Image().src = thumbUrl(next.members[0]);  // so Enter does not wait
+}
+
+function toggleZoom() {
+  const img = stage.querySelector("img"), m = view[gi].members[pi];
+  if (stage.classList.contains("zoom")) return showGroup();
+  stage.classList.add("zoom");
+  img.onload = () => {
+    stage.scrollLeft = (img.naturalWidth - stage.clientWidth) / 2;
+    stage.scrollTop = (img.naturalHeight - stage.clientHeight) / 2;
+    img.onload = null;
+  };
+  img.src = "/api/full?" + qs({ folder, name: m.name });
+}
+
+function setKeep(name, on) {
+  keep.delete(name);
+  drop.delete(name);
+  if (on && !best.has(name)) keep.add(name);
+  if (!on && best.has(name)) drop.add(name);
+  changed();
+  showGroup();
+}
+
+function groupKey(e) {
+  const g = view[gi], m = g.members[pi];
+  switch (e.key) {
+    case "ArrowLeft": pi = Math.max(0, pi - 1); showGroup(); break;
+    case "ArrowRight": pi = Math.min(g.members.length - 1, pi + 1); showGroup(); break;
+    case "ArrowUp": if (gi > 0) { moveCursor(gi - 1); openGroup(gi - 1); } break;
+    case "ArrowDown": if (gi < view.length - 1) { moveCursor(gi + 1); openGroup(gi + 1); } break;
+    case " ": setKeep(m.name, !kept(m.name)); break;
+    case "x": case "X": setKeep(m.name, false); break;
+    case "z": case "Z": toggleZoom(); break;
+    case "Escape": closeGroup(); break;
+    case "Enter":
+      g.members.forEach((x) => seen.add(x.name));
+      changed();
+      if (gi < view.length - 1) { moveCursor(gi + 1); openGroup(gi + 1); } else closeGroup();
+      break;
+    default: return;
+  }
+  e.preventDefault();
+}
+
+function overviewKey(e) {
+  const step = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -COLS, ArrowDown: COLS,
+                 PageUp: -COLS * ROWS, PageDown: COLS * ROWS }[e.key];
+  if (step) moveCursor(cur + step);
+  else if (e.key === "Enter" && cards.length) openGroup(cur);
+  else if (e.key === "f" || e.key === "F") setFilter({ all: "review", review: "todo", todo: "all" }[filter]);
+  else return;
+  e.preventDefault();
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT") return;
+  (gi >= 0 ? groupKey : overviewKey)(e);
+});
+
+// a focused button would also fire on Space/Enter meant for the viewer
+document.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => b.blur()));
+
+guard(load).then(() => guard(poll));
+</script>
+</html>

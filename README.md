@@ -22,6 +22,21 @@ uv run pic_pick.py rank <photo-folder>
 uv run pic_pick.py export <photo-folder>
 ```
 
+Or do all of it in the browser:
+
+```sh
+uv run pic_pick.py serve [--port 8765]
+```
+
+## Viewer
+
+`serve` opens a local page (bound to 127.0.0.1). Choose a folder with the button (a native dialog) or type its path, then use **Group**, **Pick** (`rank`), and **Export**; progress shows in the top bar.
+
+- Overview: one card per group showing its best photo, 5 per row, 3 rows on screen, snapping per row. Thumbnails load only after scrolling stops, for the visible rows plus one row on each side, at most 6 at a time. Filters: all, needs review, not confirmed. Keys: arrows, PgUp/PgDn, Enter to open, F to cycle filters.
+- Group: large photo, scores, and a strip of the group in ranking order. Keys: ←/→ photo, ↑/↓ group, Space toggle keep, X unkeep, Enter confirm and go to the next group, Z original at 100%, Esc back.
+
+Each group's best starts as kept. Changes save to `picks.json` as you go.
+
 If `groups.json` does not exist yet, `rank` runs the grouping first.
 
 ## Photos and RAW files
@@ -30,7 +45,7 @@ JPEG and RAW files (`.arw .cr2 .cr3 .dng .nef .orf .pef .raf .rw2 .srw`) are rea
 
 ## Export
 
-`export` moves each kept photo, with its RAW/JPEG pair and sidecars such as `IMG_1.xmp`, to `<photo-folder>-picked/`, and moves photos that are no longer kept back. Nothing is copied or deleted. Kept photos come from `runs/<folder>-<hash>/picks.json`, a JSON list of photo names, or, when that file is missing, each group's `best`. Every command scans both folders, so the groups and caches survive an export.
+`export` moves each kept photo, with its RAW/JPEG pair and sidecars such as `IMG_1.xmp`, to `<photo-folder>-picked/`, and moves photos that are no longer kept back. Nothing is copied or deleted. Kept photos are each group's `best` from `report.json`, plus `keep` and minus `drop` in `runs/<folder>-<hash>/picks.json` (`{"keep": [...], "drop": [...], "seen": [...]}`, written by the viewer). Every command scans both folders, so the groups and caches survive an export.
 
 Options:
 
