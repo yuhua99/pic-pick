@@ -1,4 +1,4 @@
-"""AI photo culling: group similar JPEGs, then let Jev pick the best of each group."""
+"""AI photo culling: group similar photos, then let Jev pick the best of each group."""
 
 import argparse
 import hashlib
@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
+import rawpy
 import typesafe_sdk as typesafe
 from PIL import ExifTags, Image, ImageFilter, ImageOps, ImageStat
 
@@ -16,6 +17,10 @@ ISO_MAX = 3200
 SIDE = 1568  # max image side the TypeSafe API accepts
 MIN_SIDE = 280  # min image side the TypeSafe API accepts
 HERE = Path(__file__).resolve().parent
+JPEG_EXTS = {".jpg", ".jpeg"}
+RAW_EXTS = {".arw", ".cr2", ".cr3", ".dng", ".nef", ".orf", ".pef", ".raf", ".rw2", ".srw"}
+# LibRaw flip -> PIL transpose; ROTATE_90 is counter-clockwise
+RAW_FLIP = {3: Image.Transpose.ROTATE_180, 5: Image.Transpose.ROTATE_90, 6: Image.Transpose.ROTATE_270}
 
 
 # ---------- step 0: read + step 2: technical scores ----------
@@ -24,24 +29,27 @@ def file_hash(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
-def open_image(path, size):
-    im = Image.open(path)
+def open_image(src, size, flip=0):
+    im = Image.open(src)
     scale = max(im.size) / size
     im.draft("RGB", (int(im.width / scale), int(im.height / scale)))  # fast JPEG decode at reduced scale
-    im = ImageOps.exif_transpose(im)
+    if flip in RAW_FLIP and ExifTags.Base.Orientation not in im.getexif():  # RAW previews often lack the tag
+        im = im.transpose(RAW_FLIP[flip])
+    else:
+        im = ImageOps.exif_transpose(im)
     if im.mode != "RGB":  # a gray/CMYK profile would mislabel the converted RGB pixels
         im.info.pop("icc_profile", None)
     return im.convert("RGB")
 
 
-def read_exif(im, path):
+def read_exif(im):
     exif = im.getexif()
     sub = exif.get_ifd(ExifTags.IFD.Exif)
     try:
         taken = sub[ExifTags.Base.DateTimeOriginal].strip("\x00 ")
         ts = datetime.strptime(taken, "%Y:%m:%d %H:%M:%S").timestamp()
     except (KeyError, ValueError):  # missing or unset camera clock, e.g. 0000:00:00
-        ts = path.stat().st_mtime
+        ts = None
     else:
         subsec = str(sub.get(ExifTags.Base.SubsecTimeOriginal, "")).strip()
         if subsec.isdigit():
@@ -56,6 +64,37 @@ def read_exif(im, path):
         "focal": num(sub.get(ExifTags.Base.FocalLengthIn35mmFilm) or sub.get(ExifTags.Base.FocalLength)),
         "iso": int(iso) if iso else None,
     }
+
+
+def load(path):
+    """Upright RGB image reduced to about SIDE, plus capture info. RAW uses its embedded JPEG preview."""
+    if path.suffix.lower() in JPEG_EXTS:
+        data, flip = path.read_bytes(), 0
+        with Image.open(path) as im:
+            exif = read_exif(im)
+    else:
+        with rawpy.imread(str(path)) as raw:
+            thumb, flip = raw.extract_thumb(), raw.sizes.flip
+            if thumb.format != rawpy.ThumbFormat.JPEG:
+                raise ValueError(f"{path.name}: no embedded JPEG preview")
+            data = thumb.data
+            with Image.open(io.BytesIO(data)) as im:
+                exif = read_exif(im)
+            if exif["time"] is None:  # many previews carry no EXIF; .other unpacks the whole raw
+                try:
+                    o = raw.other
+                except rawpy.LibRawNonFatalError:  # e.g. unsupported sensor data; preview still usable
+                    pass
+                else:
+                    exif = {
+                        "time": o.timestamp.timestamp() if o.timestamp.year > 1970 else None,
+                        "shutter": o.shutter_speed or None,
+                        "focal": o.focal_length or None,  # actual, not 35 mm equivalent
+                        "iso": int(o.iso_speed) or None,
+                    }
+    if exif["time"] is None:
+        exif["time"] = path.stat().st_mtime
+    return open_image(io.BytesIO(data), SIDE, flip), exif
 
 
 def dhash(im):
@@ -81,9 +120,7 @@ def analyze(path, work):
     cache = work / "photos" / f"{sha}.json"
     if cache.exists():
         return {**json.loads(cache.read_text()), "file": path.name}
-    with Image.open(path) as raw:
-        exif = read_exif(raw, path)
-    im = open_image(path, SIDE)
+    im, exif = load(path)
     im.thumbnail((SIDE, SIDE))  # one thumbnail for analysis, Jev, and display
     thumb = work / "thumbs" / f"{sha}.jpg"
     thumb.parent.mkdir(parents=True, exist_ok=True)
@@ -110,11 +147,39 @@ def analyze(path, work):
     return {**info, "file": path.name}
 
 
+def picked_dir(folder):  # folder is resolved by argparse, so "." works
+    return folder.parent / f"{folder.name}-picked"
+
+
+def find_photos(folder):
+    """{photo name: [paths]} across folder and its -picked sibling. Files sharing a stem
+    (RAW+JPEG) are one photo, named after the JPEG when there is one. Other files starting
+    with the stem plus a dot, such as IMG_1.xmp or IMG_1.CR3.xmp sidecars, come along."""
+    by_stem, others = {}, []
+    for d in (folder, picked_dir(folder)):
+        for p in sorted(d.iterdir()) if d.is_dir() else []:
+            if p.suffix.lower() in JPEG_EXTS | RAW_EXTS:
+                by_stem.setdefault(p.stem, []).append(p)
+            elif p.is_file():
+                others.append(p)
+    for stem, paths in by_stem.items():
+        if len({p.parent for p in paths}) > 1:
+            sys.exit(f"files of {stem} are split between {folder} and {picked_dir(folder)}; move them into one folder")
+        paths.sort(key=lambda p: p.suffix.lower() not in JPEG_EXTS)  # JPEG first: it names the photo
+    for p in others:  # a sidecar belongs to the longest matching stem, e.g. IMG_1.edit.xmp -> IMG_1.edit
+        parts = p.name.split(".")
+        stems = [s for i in range(len(parts) - 1, 0, -1)
+                 if (s := ".".join(parts[:i])) in by_stem and by_stem[s][0].parent == p.parent]
+        if stems:
+            by_stem[stems[0]].append(p)
+    return {paths[0].name: paths for paths in by_stem.values()}
+
+
 def scan(folder, work, jobs):
-    paths = sorted(p for p in folder.iterdir() if p.suffix.lower() in (".jpg", ".jpeg"))
+    found = find_photos(folder)
     work.mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(jobs) as pool:
-        return {p["file"]: p for p in pool.map(lambda p: analyze(p, work), paths)}
+        return {p["file"]: p for p in pool.map(lambda paths: analyze(paths[0], work), found.values())}
 
 
 # ---------- step 1: grouping ----------
@@ -299,12 +364,47 @@ def cmd_rank(args):
     print(f"report: {work / 'report.json'}")
 
 
+def cmd_export(args):
+    """Move kept photos (all files sharing the stem) to <folder>-picked and the rest back."""
+    work = workdir(args.folder)
+    if (work / "picks.json").exists():
+        source = work / "picks.json"
+        keep = set(json.loads(source.read_text()))
+    elif (work / "report.json").exists():
+        source = work / "report.json"
+        keep = {g["best"] for g in json.loads(source.read_text())["groups"]}
+    else:
+        sys.exit(f"no picks.json or report.json in {work}; run rank first")
+    dest_keep = picked_dir(args.folder)
+    found = find_photos(args.folder)
+    unknown = keep - set(found)
+    if unknown:
+        sys.exit(f"{source} lists unknown photos: {', '.join(sorted(unknown))}")
+    moves = [
+        (p, dest / p.name)
+        for name, paths in found.items()
+        for dest in [dest_keep if name in keep else args.folder]
+        for p in paths if p.parent != dest
+    ]
+    clash = [str(t) for _, t in moves if t.exists()]  # rename would overwrite, e.g. case-only clash on macOS
+    if clash:
+        sys.exit(f"would overwrite: {', '.join(clash)}")
+    for p, t in moves:
+        t.parent.mkdir(exist_ok=True)
+        p.rename(t)
+    print(f"moved {len(moves)} files; kept photos are in {dest_keep}")
+
+
+def folder_arg(s):
+    return Path(s).resolve()
+
+
 def main():
     parser = argparse.ArgumentParser(prog="pic_pick.py", description=__doc__)
     sub = parser.add_subparsers(required=True)
 
     def common(p):
-        p.add_argument("folder", type=Path)
+        p.add_argument("folder", type=folder_arg)
         p.add_argument("--gap", type=float, default=60, help="a photo may join a group with a member taken within this many seconds")
         p.add_argument("--dhash", type=int, default=10, help="max dHash distance (0-64) in a group")
         p.add_argument("--jobs", type=int, default=4, help="parallel workers / Jev calls")
@@ -317,6 +417,10 @@ def main():
     common(p)
     p.add_argument("--model", default="jev-latest")
     p.set_defaults(func=cmd_rank)
+
+    p = sub.add_parser("export", help="move kept photos to <folder>-picked (picks.json, else each group's best)")
+    p.add_argument("folder", type=folder_arg)
+    p.set_defaults(func=cmd_export)
 
     args = parser.parse_args()
     args.func(args)

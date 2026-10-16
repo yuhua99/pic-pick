@@ -1,6 +1,6 @@
 # pic-pick
 
-Groups JPEGs of the same scene and has [Jev](https://docs.typesafe.ai) score each photo to pick the best shot of each group.
+Groups photos of the same scene and has [Jev](https://docs.typesafe.ai) score each photo to pick the best shot of each group.
 
 ## Requirements
 
@@ -17,9 +17,20 @@ uv run pic_pick.py group <photo-folder>
 
 # 3. Score each photo and write report.json
 uv run pic_pick.py rank <photo-folder>
+
+# 4. Move kept photos to <photo-folder>-picked
+uv run pic_pick.py export <photo-folder>
 ```
 
 If `groups.json` does not exist yet, `rank` runs the grouping first.
+
+## Photos and RAW files
+
+JPEG and RAW files (`.arw .cr2 .cr3 .dng .nef .orf .pef .raf .rw2 .srw`) are read. Files sharing a name stem, such as `IMG_1.JPG` + `IMG_1.CR3`, count as one photo named after the JPEG and analyzed from it. A RAW file without a JPEG is analyzed from its embedded JPEG preview.
+
+## Export
+
+`export` moves each kept photo, with its RAW/JPEG pair and sidecars such as `IMG_1.xmp`, to `<photo-folder>-picked/`, and moves photos that are no longer kept back. Nothing is copied or deleted. Kept photos come from `runs/<folder>-<hash>/picks.json`, a JSON list of photo names, or, when that file is missing, each group's `best`. Every command scans both folders, so the groups and caches survive an export.
 
 Options:
 
